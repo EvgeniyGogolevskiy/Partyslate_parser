@@ -8,7 +8,6 @@ This script scrapes the first 50 (configurable) vendor listings from PartySlate'
 - ✅ **Resilient selectors** with text-based fallbacks.
 - ✅ **Graceful retries & timeouts**; **rate limiting** between requests.
 - ✅ **Robots.txt** respected for vendor-site enrichment.
-- ✅ **Optional Google Places API** enrichment if you set `GOOGLE_MAPS_API_KEY`.
 - ✅ **Type hints, dataclasses, structured logging**.
 - ✅ **Excel export** in the exact columns you requested.
 
@@ -19,12 +18,6 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python -m playwright install
-```
-
-(Optional) Set a Google Places API key to enrich website/phone when not present on PartySlate/vendor site:
-
-```bash
-export GOOGLE_MAPS_API_KEY=your_key_here
 ```
 
 ## Run
