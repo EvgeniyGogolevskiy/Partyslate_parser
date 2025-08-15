@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-PartySlate Miami Event Planners Parser (Improved)
--------------------------------------------------
-- Pagination across ?page=N
-- Robust selectors (has_text)
-- Non-blocking robots.txt fetch with timeouts
-- Vendor-level watchdog timeout
-- Rich logging for visibility into progress & bottlenecks
-- No mutable global flags (config object passed through)
-"""
-
-from __future__ import annotations
-
 import asyncio
 import contextlib
 import dataclasses
