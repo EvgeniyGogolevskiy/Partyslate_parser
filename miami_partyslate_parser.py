@@ -3,7 +3,6 @@ import contextlib
 import dataclasses
 from dataclasses import dataclass, field
 import logging
-import os
 import random
 import re
 import sys
@@ -25,17 +24,16 @@ DEFAULT_LISTING_URL = "https://www.partyslate.com/find-vendors/event-planner/are
 DEFAULT_VENDOR_LIMIT = 50
 DEFAULT_OUTFILE = "miami_event_agencies.xlsx"
 
-PAGE_TIMEOUT_MS = 30000
-NAVIGATION_TIMEOUT_MS = 35000
+PAGE_TIMEOUT_MS = 35000
+NAVIGATION_TIMEOUT_MS = 40000
 VENDOR_CONCURRENCY = 3
-HTTP_TIMEOUT = 12.0
+HTTP_TIMEOUT = 15.0
 MIN_DELAY = 0.4
 MAX_DELAY = 1.0
 
-# Hard caps
-VENDOR_TOTAL_TIMEOUT = 75  # seconds per vendor task
-ROBOTS_TIMEOUT = 5.0       # seconds for robots.txt
-MAX_CONTACT_PAGES = 6      # cap enrichment fetches
+VENDOR_TOTAL_TIMEOUT = 150
+ROBOTS_TIMEOUT = 5.0
+MAX_CONTACT_PAGES = 4
 
 # Patterns
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
@@ -222,7 +220,6 @@ async def get_vendor_links_from_listing(page: Page, base_url: str, limit: int) -
             await page.goto(listing_url, timeout=NAVIGATION_TIMEOUT_MS)
         await asyncio.sleep(rand_delay())
 
-        # Wait a bit for content hydrate
         with contextlib.suppress(Exception):
             await page.wait_for_selector('a[href^="/vendors/"]', timeout=6000)
 
@@ -245,7 +242,6 @@ async def get_vendor_links_from_listing(page: Page, base_url: str, limit: int) -
 
         logging.info("Collected %d new vendor links on page %d (total=%d)", page_links, page_num, len(collected))
 
-        # Heuristic: if this page yielded 0 new links, stop paginating
         if page_links == 0:
             logging.info("No new links found on page %d; stopping pagination.", page_num)
             break
@@ -258,7 +254,7 @@ async def get_vendor_links_from_listing(page: Page, base_url: str, limit: int) -
 
 
 async def parse_vendor_page(page: Page, url: str) -> VendorPageData:
-    vpd = VendorPageData()  # всегда создаём пустую структуру
+    vpd = VendorPageData()
     start = time.time()
     logging.info("→ Parse vendor: %s", url)
 
@@ -285,57 +281,131 @@ async def parse_vendor_page(page: Page, url: str) -> VendorPageData:
                 with contextlib.suppress(Exception):
                     phone_text = await page.locator(".css-1dvr8y4").first.inner_text()
                     vpd.phone = normalize_phone(phone_text)
+
+                try:
+                    close_btn = page.locator("button[aria-label='Close']")
+                    if await close_btn.count() > 0:
+                        await close_btn.first.click()
+                        await asyncio.sleep(0.5)
+                    else:
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+
         except Exception as e:
             logging.warning("Follow Us block not found for %s: %s", url, e)
 
         # 3 & 4) Contact Person
         members: List[TeamMember] = []
+
         team_section = None
-        for label in ["Meet the Team", "Meet The Team", "Our Team", "Team"]:
+        for label in ["Meet the Team", "Meet The Team"]:
             with contextlib.suppress(Exception):
-                loc = page.locator("section", has_text=label)
+                loc = page.locator(f"section:has-text('{label}'), div:has-text('{label}')")
                 if await loc.count() > 0:
                     team_section = loc.first
                     break
 
-        if team_section:
-            for sel in ["article", "div[role='listitem']", "li", "div", "a"]:
-                with contextlib.suppress(Exception):
-                    cards = team_section.locator(sel)
-                    cnt = await cards.count()
-                    if cnt == 0:
-                        continue
-                    for i in range(cnt):
-                        card = cards.nth(i)
+        if not team_section:
+            vpd.team = members
+        else:
+            async def read_current_name_title() -> tuple[str, str]:
+                name, title = "", ""
+                for sel in ["article hgroup h3", "article h3", ".css-1ham2m0", "h3, h4, strong, b"]:
+                    with contextlib.suppress(Exception):
+                        el = team_section.locator(sel).first
+                        if await el.count() > 0:
+                            txt = (await el.inner_text()).strip()
+                            if txt:
+                                name = clean_text(txt)
+                                break
+                for sel in ["article hgroup span", "span.css-1pxun7d", "article h4", "span, em, i, small"]:
+                    with contextlib.suppress(Exception):
+                        el = team_section.locator(sel).first
+                        if await el.count() > 0:
+                            txt = (await el.inner_text()).strip()
+                            if txt:
+                                title = clean_text(txt)
+                                break
 
-                        # name
-                        name = ""
-                        with contextlib.suppress(Exception):
-                            name = clean_text(await card.locator("h3, h4, strong, b").first.inner_text())
-                        if not name:
-                            with contextlib.suppress(Exception):
-                                text = clean_text(await card.inner_text())
-                                parts = [p for p in text.split("\n") if p.strip()]
-                                if parts:
-                                    name = parts[0][:120]
+                if not name:
+                    with contextlib.suppress(Exception):
+                        blob = await (team_section.locator("article").first if await team_section.locator("article").count() > 0 else team_section).inner_text()
+                        lines = [l.strip() for l in blob.split("\n") if l.strip()]
+                        ignore = re.compile(r"^(meet\s*the\s*team|our\s*team|faqs|pricing packages|overview|follow us)$", re.I)
+                        pages = re.compile(r"^\d+\s*\/\s*\d+$")
+                        for i, l in enumerate(lines):
+                            if ignore.match(l) or pages.match(l):
+                                continue
+                            if re.search(r"[A-Za-zА-Яа-я]", l) and len(l) > 1 and not re.search(r"@\w+", l):
+                                name = clean_text(l)
+                                if i + 1 < len(lines):
+                                    nxt = lines[i + 1]
+                                    if not ignore.match(nxt) and not pages.match(nxt) and len(nxt) < 120:
+                                        title = clean_text(nxt)
+                                break
+                return (name or ""), (title or "")
 
-                        # job title
-                        title = ""
-                        with contextlib.suppress(Exception):
-                            title = clean_text(await card.locator("em, i, small, span").first.inner_text())
-                        if not title:
-                            with contextlib.suppress(Exception):
-                                text = clean_text(await card.inner_text())
-                                parts = [p for p in text.split("\n") if p.strip()]
-                                if len(parts) >= 2:
-                                    title = parts[1][:160]
+            next_btn = team_section.locator(
+                "button[aria-label='view next team member'],"
+                "button[aria-label*='next team member'],"
+                "button.css-1qz0g1e:nth-child(2)"
+            )
+            has_next = await next_btn.count() > 0
 
-                        if name or title:
-                            members.append(TeamMember(name=name, title=title, phone="", email=""))
+            total_pages = None
+            with contextlib.suppress(Exception):
+                pag = team_section.locator("span:has-text('/')").first
+                if await pag.count() > 0:
+                    pag_text = (await pag.inner_text()).strip()
+                    m = re.search(r"(\d+)\s*/\s*(\d+)", pag_text)
+                    if m:
+                        total_pages = int(m.group(2)) or None
 
-                    if members:
+            collected_names: set[str] = set()
+
+            if has_next or (total_pages and total_pages > 1):
+                max_iter = total_pages if (total_pages and total_pages > 0) else 20
+                for i in range(max_iter):
+                    name, title = await read_current_name_title()
+                    if name and name not in collected_names:
+                        members.append(TeamMember(name=name[:120], title=title[:160], phone="", email=""))
+                        collected_names.add(name)
+
+                    if total_pages and i >= total_pages - 1:
                         break
-        vpd.team = members
+
+                    progressed = False
+                    with contextlib.suppress(Exception):
+                        btn = next_btn.first
+                        if await btn.count() > 0:
+                            await btn.click(force=True)
+                            for _ in range(20):
+                                await page.wait_for_timeout(150)
+                                new_name, _ = await read_current_name_title()
+                                if new_name and new_name != name:
+                                    progressed = True
+                                    break
+                    if not progressed:
+                        break
+            else:
+                name, title = await read_current_name_title()
+
+                if name and name not in collected_names:
+                    members.append(
+                        TeamMember(
+                            name=name[:120],
+                            title=(title or "")[:160],
+                            phone="",
+                            email="",
+                        )
+                    )
+                    collected_names.add(name)
+
+            vpd.team = members
+
 
         # 7) Minimum spend
         with contextlib.suppress(Exception):
@@ -366,50 +436,60 @@ async def parse_vendor_page(page: Page, url: str) -> VendorPageData:
     return vpd
 
 async def enrich_from_official_site(vpd: VendorPageData) -> VendorPageData:
+    try:
+        if not vpd.website:
+            logging.info("Enrich skipped: no website for %s", vpd.company_name)
+            return vpd
 
-    website = vpd.website if is_absolute_url(vpd.website) else f"http://{vpd.website}"
-    paths = [website]
-    for suffix in ["/contact", "/contact-us", "/contactus", "/about", "/team", "/about-us"]:
-        paths.append(website.rstrip("/") + suffix)
+        website = vpd.website if is_absolute_url(vpd.website) else f"http://{vpd.website}"
+        paths = [website]
+        for suffix in ["/contact", "/contact-us", "/contactus", "/about", "/team", "/about-us"]:
+            paths.append(website.rstrip("/") + suffix)
 
-    logging.info("Enrich: %s | checking up to %d pages", vpd.company_name or website, min(len(paths), MAX_CONTACT_PAGES))
+        logging.info("Enrich: %s | checking up to %d pages", vpd.company_name or website, min(len(paths), MAX_CONTACT_PAGES))
 
-    async with httpx.AsyncClient(follow_redirects=True, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; EventAgencyParser/1.0)"
-    }) as client:
         html_blobs: List[str] = []
-        for u in unique(paths)[:MAX_CONTACT_PAGES]:
-            html = await fetch_text_httpx(u, client, check_robots=True)
-            if html:
-                html_blobs.append(html)
-                logging.debug("Enrich fetched: %s (len=%d)", u, len(html))
-            await asyncio.sleep(rand_delay(0.2, 0.5))
+        async with httpx.AsyncClient(follow_redirects=True, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; EventAgencyParser/1.0)"
+        }) as client:
+            for u in unique(paths)[:MAX_CONTACT_PAGES]:
+                with contextlib.suppress(Exception):
+                    html = await fetch_text_httpx(u, client, check_robots=True)
+                    if html:
+                        html_blobs.append(html)
+                        logging.debug("Enrich fetched: %s (len=%d)", u, len(html))
+                await asyncio.sleep(rand_delay(0.2, 0.5))
 
-    if not html_blobs:
-        return vpd
+        if not html_blobs:
+            return vpd
 
-    all_text = "\n".join(html_blobs)
-    emails = extract_emails_from_text(all_text)
-    phones = extract_phones_from_text(all_text)
+        all_text = "\n".join(html_blobs)
 
-    if not vpd.phone and phones:
-        vpd.phone = phones[0]
+        with contextlib.suppress(Exception):
+            emails = extract_emails_from_text(all_text)
+            if emails:
+                for i, tm in enumerate(vpd.team):
+                    if not tm.email and i < len(emails):
+                        tm.email = emails[i]
 
-    if emails:
-        for i, tm in enumerate(vpd.team):
-            if not tm.email and i < len(emails):
-                tm.email = emails[i]
+        with contextlib.suppress(Exception):
+            phones = extract_phones_from_text(all_text)
+            if not vpd.phone and phones:
+                vpd.phone = phones[0]
 
-    for html in html_blobs:
-        soup = BeautifulSoup(html, "lxml")
-        soc = extract_social_links_from_html(soup)
-        if not vpd.instagram and soc.get("instagram"):
-            vpd.instagram = soc["instagram"]
-        if not vpd.facebook and soc.get("facebook"):
-            vpd.facebook = soc["facebook"]
+        for html in html_blobs:
+            with contextlib.suppress(Exception):
+                soup = BeautifulSoup(html, "lxml")
+                soc = extract_social_links_from_html(soup)
+                if not vpd.instagram and soc.get("instagram"):
+                    vpd.instagram = soc["instagram"]
+                if not vpd.facebook and soc.get("facebook"):
+                    vpd.facebook = soc["facebook"]
+
+    except Exception:
+        logging.exception("Fatal error in enrich_from_official_site for %s", vpd.company_name or "unknown")
 
     return vpd
-
 
 # ---------------------------
 # Runner
@@ -420,18 +500,31 @@ async def process_vendor(link: str, browser: Browser, idx: int, total: int) -> V
     page = await browser.new_page()
     page.set_default_timeout(PAGE_TIMEOUT_MS)
     logging.info("Vendor %d/%d: start %s", idx, total, link)
+
+    vpd = VendorPageData()
     try:
         vpd = await parse_vendor_page(page, link)
+
         await asyncio.sleep(rand_delay())
-        vpd = await enrich_from_official_site(vpd)
-        logging.info("Vendor %d/%d: done %s in %.1fs (team=%d)", idx, total, vpd.company_name or link, time.time() - start, len(vpd.team))
-        return vpd
+
+        try:
+            vpd = await enrich_from_official_site(vpd)
+        except Exception:
+            logging.exception("Vendor %d/%d: error in enrich_from_official_site %s", idx, total, link)
+
+        logging.info(
+            "Vendor %d/%d: done %s in %.1fs (team=%d)",
+            idx, total, vpd.company_name or link, time.time() - start, len(vpd.team)
+        )
+
     except Exception:
-        logging.exception("Vendor %d/%d: fatal error %s", idx, total, link)
-        return VendorPageData()
+        logging.exception("Vendor %d/%d: fatal error in parse %s", idx, total, link)
+
     finally:
         with contextlib.suppress(Exception):
             await page.close()
+
+    return vpd
 
 
 async def main_async(config: ParserConfig) -> None:
@@ -472,33 +565,32 @@ async def main_async(config: ParserConfig) -> None:
 
             rows: List[VendorRecord] = []
             for v in results:
-                if not v.company_name and not v.team and not v.website and not v.phone:
-                    continue
                 if v.team:
                     for tm in v.team:
                         rows.append(VendorRecord(
-                            company_name=v.company_name,
-                            website=v.website,
-                            contact_person=tm.name,
-                            job_title=tm.title,
-                            phone=tm.phone or v.phone,
-                            email=tm.email,
-                            minimum_spend=v.minimum_spend,
-                            instagram=v.instagram,
-                            facebook=v.facebook,
+                            company_name=v.company_name or "",
+                            website=v.website or "",
+                            contact_person=tm.name or "",
+                            job_title=tm.title or "",
+                            phone=tm.phone or v.phone or "",
+                            email=tm.email or "",
+                            minimum_spend=v.minimum_spend or "",
+                            instagram=v.instagram or "",
+                            facebook=v.facebook or "",
                         ))
                 else:
                     rows.append(VendorRecord(
-                        company_name=v.company_name,
-                        website=v.website,
+                        company_name=v.company_name or "",
+                        website=v.website or "",
                         contact_person="",
                         job_title="",
-                        phone=v.phone,
+                        phone=v.phone or "",
                         email="",
-                        minimum_spend=v.minimum_spend,
-                        instagram=v.instagram,
-                        facebook=v.facebook,
+                        minimum_spend=v.minimum_spend or "",
+                        instagram=v.instagram or "",
+                        facebook=v.facebook or "",
                     ))
+
 
             df = pd.DataFrame([dataclasses.asdict(r) for r in rows], columns=[
                 "company_name",
@@ -563,7 +655,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-#ddkfjsdljkfjfdjfjdg
-    #dkljfdfkg
