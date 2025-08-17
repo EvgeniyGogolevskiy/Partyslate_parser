@@ -3,9 +3,10 @@ import contextlib
 import dataclasses
 from dataclasses import dataclass, field
 import logging
-import random
 import re
 import sys
+import os
+from dotenv import load_dotenv
 import time
 from typing import List, Optional, Dict, Iterable, Tuple, Set
 from urllib.parse import urljoin, urlparse
@@ -16,33 +17,10 @@ import httpx
 from bs4 import BeautifulSoup
 import urllib.robotparser as robotparser
 
-# ---------------------------
-# Config & Constants
-# ---------------------------
+load_dotenv()
 
-DEFAULT_LISTING_URL = "https://www.partyslate.com/find-vendors/event-planner/area/miami"
-DEFAULT_VENDOR_LIMIT = 50
-DEFAULT_OUTFILE = "miami_event_agencies.xlsx"
+from helpers import rand_delay, clean_text, normalize_phone, unique, is_absolute_url, extract_emails_from_text, extract_phones_from_text, extract_social_links_from_html
 
-PAGE_TIMEOUT_MS = 35000
-NAVIGATION_TIMEOUT_MS = 40000
-VENDOR_CONCURRENCY = 3
-HTTP_TIMEOUT = 15.0
-MIN_DELAY = 0.4
-MAX_DELAY = 1.0
-
-VENDOR_TOTAL_TIMEOUT = 150
-ROBOTS_TIMEOUT = 5.0
-MAX_CONTACT_PAGES = 4
-
-# Patterns
-EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-PHONE_REGEX = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?|\d{3})[-.\s]?\d{3}[-.\s]?\d{4}")
-SOCIAL_PATTERNS = {
-    "instagram": re.compile(r"instagram\.com", re.IGNORECASE),
-    "facebook": re.compile(r"(facebook|fb)\.com", re.IGNORECASE),
-}
-CURRENCY_VAL = re.compile(r"\$[\d,]+(?:\.\d{2})?")
 
 # ---------------------------
 # Data Models
@@ -83,92 +61,16 @@ class VendorPageData:
 @dataclass
 class ParserConfig:
     headless: bool = True
-    listing_url: str = DEFAULT_LISTING_URL
-    limit: int = DEFAULT_VENDOR_LIMIT
-    out_path: str = DEFAULT_OUTFILE
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def rand_delay(a: float = MIN_DELAY, b: float = MAX_DELAY) -> float:
-    return random.uniform(a, b)
-
-def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", s).strip()
-
-def normalize_phone(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"^tel:", "", s, flags=re.IGNORECASE)
-    return s.strip()
-
-def unique(seq: Iterable[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
-
-def is_absolute_url(url: str) -> bool:
-    return bool(urlparse(url).scheme)
-
-def is_social(href: str) -> Tuple[bool, Optional[str]]:
-    for name, pat in SOCIAL_PATTERNS.items():
-        if pat.search(href or ""):
-            return True, name
-    return False, None
-
-def prefer_offsite_website(links: List[str]) -> Optional[str]:
-    for href in links:
-        if not href:
-            continue
-        if "partyslate.com" in href:
-            continue
-        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
-            continue
-        if is_absolute_url(href):
-            return href
-    return None
-
-def extract_emails_from_text(text: str) -> List[str]:
-    return unique([m.group(0) for m in EMAIL_REGEX.finditer(text or "")])
-
-def extract_phones_from_text(text: str) -> List[str]:
-    return unique([normalize_phone(m.group(0)) for m in PHONE_REGEX.finditer(text or "")])
-
-def extract_social_links_from_html(soup: BeautifulSoup) -> Dict[str, str]:
-    social = {"instagram": "", "facebook": ""}
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        is_soc, name = is_social(href)
-        if is_soc and name and not social.get(name):
-            social[name] = href
-    return social
-
-def extract_minimum_spend_text(text: str) -> str:
-    if not text:
-        return ""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for l in lines:
-        if re.search(r"(minimum|starting|start at|from)\b", l, re.IGNORECASE) and CURRENCY_VAL.search(l):
-            return clean_text(l)
-    for l in lines:
-        if CURRENCY_VAL.search(l) and re.search(r"(budget|spend|min)", l, re.IGNORECASE):
-            return clean_text(l)
-    return ""
+    listing_url: str = os.getenv("DEFAULT_LISTING_URL")
+    limit: int = int(os.getenv("DEFAULT_VENDOR_LIMIT"))
+    out_path: str = os.getenv("DEFAULT_OUTFILE")
 
 async def robots_can_fetch(client: httpx.AsyncClient, url: str, user_agent: str = "*") -> bool:
-    """Fetch robots.txt with a small timeout and check can_fetch; on failure, default to True (fail-open)."""
     try:
         p = urlparse(url)
         base = f"{p.scheme}://{p.netloc}"
         robots_url = urljoin(base, "/robots.txt")
-        resp = await client.get(robots_url, timeout=ROBOTS_TIMEOUT)
+        resp = await client.get(robots_url, timeout=float(os.getenv("ROBOTS_TIMEOUT")))
         if resp.status_code != 200 or not resp.text:
             return True
         rp = robotparser.RobotFileParser()
@@ -197,9 +99,7 @@ async def fetch_text_httpx(url: str, client: httpx.AsyncClient, check_robots: bo
 # ---------------------------
 
 async def get_vendor_links_from_listing(page: Page, base_url: str, limit: int) -> List[str]:
-    """
-    Traverse pagination ?page=N and collect vendor profile URLs until `limit`.
-    """
+ 
     def _with_page(url: str, page_num: int) -> str:
         if "page=" in url:
             return re.sub(r"([?&])page=\d+", rf"\\1page={page_num}", url)
@@ -214,10 +114,10 @@ async def get_vendor_links_from_listing(page: Page, base_url: str, limit: int) -
         listing_url = _with_page(base_url, page_num)
         logging.info("Listing page %d → %s", page_num, listing_url)
         try:
-            await page.goto(listing_url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.goto(listing_url, timeout=int(os.getenv("NAVIGATION_TIMEOUT_MS")), wait_until="domcontentloaded")
         except PlaywrightTimeoutError:
             logging.warning("Timeout navigating to listing page %s; retrying basic goto", listing_url)
-            await page.goto(listing_url, timeout=NAVIGATION_TIMEOUT_MS)
+            await page.goto(listing_url, timeout=int(os.getenv("NAVIGATION_TIMEOUT_MS")))
         await asyncio.sleep(rand_delay())
 
         with contextlib.suppress(Exception):
@@ -260,7 +160,7 @@ async def parse_vendor_page(page: Page, url: str) -> VendorPageData:
 
     try:
         with contextlib.suppress(Exception):
-            await page.goto(url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.goto(url, timeout=int(os.getenv("NAVIGATION_TIMEOUT_MS")), wait_until="domcontentloaded")
             await asyncio.sleep(1.5)
 
         # 1) Company Name
@@ -446,13 +346,13 @@ async def enrich_from_official_site(vpd: VendorPageData) -> VendorPageData:
         for suffix in ["/contact", "/contact-us", "/contactus", "/about", "/team", "/about-us"]:
             paths.append(website.rstrip("/") + suffix)
 
-        logging.info("Enrich: %s | checking up to %d pages", vpd.company_name or website, min(len(paths), MAX_CONTACT_PAGES))
+        logging.info("Enrich: %s | checking up to %d pages", vpd.company_name or website, min(len(paths), int(os.getenv("MAX_CONTACT_PAGES"))))
 
         html_blobs: List[str] = []
         async with httpx.AsyncClient(follow_redirects=True, headers={
             "User-Agent": "Mozilla/5.0 (compatible; EventAgencyParser/1.0)"
         }) as client:
-            for u in unique(paths)[:MAX_CONTACT_PAGES]:
+            for u in unique(paths)[:int(os.getenv("MAX_CONTACT_PAGES"))]:
                 with contextlib.suppress(Exception):
                     html = await fetch_text_httpx(u, client, check_robots=True)
                     if html:
@@ -498,7 +398,7 @@ async def enrich_from_official_site(vpd: VendorPageData) -> VendorPageData:
 async def process_vendor(link: str, browser: Browser, idx: int, total: int) -> VendorPageData:
     start = time.time()
     page = await browser.new_page()
-    page.set_default_timeout(PAGE_TIMEOUT_MS)
+    page.set_default_timeout(int(os.getenv("PAGE_TIMEOUT_MS")))
     logging.info("Vendor %d/%d: start %s", idx, total, link)
 
     vpd = VendorPageData()
@@ -535,7 +435,7 @@ async def main_async(config: ParserConfig) -> None:
         browser = await pw.chromium.launch(headless=config.headless)
         try:
             page = await browser.new_page()
-            page.set_default_timeout(PAGE_TIMEOUT_MS)
+            page.set_default_timeout(int(os.getenv("PAGE_TIMEOUT_MS")))
             vendor_links = await get_vendor_links_from_listing(page, config.listing_url, config.limit)
             logging.info("Collected %d vendor links", len(vendor_links))
             await page.close()
@@ -545,18 +445,18 @@ async def main_async(config: ParserConfig) -> None:
                 logging.warning("No vendor links found. Exiting.")
                 return
 
-            sem = asyncio.Semaphore(VENDOR_CONCURRENCY)
+            sem = asyncio.Semaphore(int(os.getenv("VENDOR_CONCURRENCY")))
             results: List[VendorPageData] = []
 
             async def guarded_worker(i: int, link: str):
                 async with sem:
                     try:
-                        return await asyncio.wait_for(process_vendor(link, browser, i+1, total), timeout=VENDOR_TOTAL_TIMEOUT)
+                        return await asyncio.wait_for(process_vendor(link, browser, i+1, total), timeout=int(os.getenv("VENDOR_TOTAL_TIMEOUT")))
                     except asyncio.TimeoutError:
-                        logging.error("Vendor %d/%d: timed out after %ds (%s)", i+1, total, VENDOR_TOTAL_TIMEOUT, link)
+                        logging.error("Vendor %d/%d: timed out after %ds (%s)", i+1, total, int(os.getenv("VENDOR_TOTAL_TIMEOUT")), link)
                         return VendorPageData()
 
-            logging.info("Begin vendor processing with concurrency=%d", VENDOR_CONCURRENCY)
+            logging.info("Begin vendor processing with concurrency=%d", int(os.getenv("VENDOR_CONCURRENCY")))
             tasks = [asyncio.create_task(guarded_worker(i, link)) for i, link in enumerate(vendor_links)]
             for i, task in enumerate(asyncio.as_completed(tasks), start=1):
                 vpd = await task
@@ -627,9 +527,9 @@ async def main_async(config: ParserConfig) -> None:
 def parse_args() -> ParserConfig:
     import argparse
     parser = argparse.ArgumentParser(description="Scrape PartySlate Miami Event Planners and export to Excel.")
-    parser.add_argument("--limit", type=int, default=DEFAULT_VENDOR_LIMIT, help="Number of vendors to scrape (default 50)")
-    parser.add_argument("--out", type=str, default=DEFAULT_OUTFILE, help="Output Excel path")
-    parser.add_argument("--listing-url", type=str, default=DEFAULT_LISTING_URL, help="PartySlate listing URL")
+    parser.add_argument("--limit", type=int, default=int(os.getenv("DEFAULT_VENDOR_LIMIT")), help="Number of vendors to scrape (default 50)")
+    parser.add_argument("--out", type=str, default=os.getenv("DEFAULT_OUTFILE"), help="Output Excel path")
+    parser.add_argument("--listing-url", type=str, default=os.getenv("DEFAULT_LISTING_URL"), help="PartySlate listing URL")
     parser.add_argument("--headful", action="store_true", help="Run browser in headful mode (default: headless)")
     args = parser.parse_args()
     return ParserConfig(

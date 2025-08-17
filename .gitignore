@@ -9,6 +9,7 @@ venv/
 .venv/
 env/
 .env/
+.env
 
 # Editor-specific files
 .vscode/
